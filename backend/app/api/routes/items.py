@@ -1,109 +1,170 @@
-import uuid
-from typing import Any
+from datetime import timedelta
+from typing import Annotated, Any
 
-from fastapi import APIRouter, HTTPException
-from sqlmodel import func, select
+from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import HTMLResponse
+from fastapi.security import OAuth2PasswordRequestForm
 
-from app.api.deps import CurrentUser, SessionDep
-from app.models import Item, ItemCreate, ItemPublic, ItemsPublic, ItemUpdate, Message
+from app import crud
+from app.api.deps import CurrentUser, SessionDep, get_current_active_superuser
+from app.core import security
+from app.core.config import settings
+from app.core.security import get_password_hash
+from app.models import Message, NewPassword, Token, UserPublic
+from app.utils import (
+    generate_password_reset_token,
+    generate_reset_password_email,
+    send_email,
+    verify_password_reset_token,
+)
 
-router = APIRouter(prefix="/items", tags=["items"])
+router = APIRouter(tags=["login"])
 
-
-@router.get("/", response_model=ItemsPublic)
-def read_items(
-    session: SessionDep, current_user: CurrentUser, skip: int = 0, limit: int = 100
-) -> Any:
+# New endpoint for doctor login
+@router.post("/login/doctor-access-token")
+def login_doctor_access_token(
+    session: SessionDep, form_data: Annotated[OAuth2PasswordRequestForm, Depends()]
+) -> Token:
     """
-    Retrieve items.
+    OAuth2 compatible token login for doctors.
     """
-
-    if current_user.is_superuser:
-        count_statement = select(func.count()).select_from(Item)
-        count = session.exec(count_statement).one()
-        statement = select(Item).offset(skip).limit(limit)
-        items = session.exec(statement).all()
-    else:
-        count_statement = (
-            select(func.count())
-            .select_from(Item)
-            .where(Item.owner_id == current_user.id)
+    user = crud.authenticate(
+        session=session, email=form_data.username, password=form_data.password
+    )
+    if not user:
+        raise HTTPException(status_code=400, detail="Incorrect email or password")
+    if not user.is_active:
+        raise HTTPException(status_code=400, detail="Inactive user")
+    # Check if the user's email is in the configured list of doctor emails.
+    if user.email not in settings.DOCTOR_EMAILS:
+        raise HTTPException(
+            status_code=403, detail="User is not registered as a doctor"
         )
-        count = session.exec(count_statement).one()
-        statement = (
-            select(Item)
-            .where(Item.owner_id == current_user.id)
-            .offset(skip)
-            .limit(limit)
+    access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    return Token(
+        access_token=security.create_access_token(
+            user.id, expires_delta=access_token_expires
         )
-        items = session.exec(statement).all()
+    )
 
-    return ItemsPublic(data=items, count=count)
-
-
-@router.get("/{id}", response_model=ItemPublic)
-def read_item(session: SessionDep, current_user: CurrentUser, id: uuid.UUID) -> Any:
+# New endpoint for patient login
+@router.post("/login/patient-access-token")
+def login_patient_access_token(
+    session: SessionDep, form_data: Annotated[OAuth2PasswordRequestForm, Depends()]
+) -> Token:
     """
-    Get item by ID.
+    OAuth2 compatible token login for patients.
     """
-    item = session.get(Item, id)
-    if not item:
-        raise HTTPException(status_code=404, detail="Item not found")
-    if not current_user.is_superuser and (item.owner_id != current_user.id):
-        raise HTTPException(status_code=400, detail="Not enough permissions")
-    return item
+    user = crud.authenticate(
+        session=session, email=form_data.username, password=form_data.password
+    )
+    if not user:
+        raise HTTPException(status_code=400, detail="Incorrect email or password")
+    if not user.is_active:
+        raise HTTPException(status_code=400, detail="Inactive user")
+    # For patients, ensure the user's email is not in the doctor email list.
+    if user.email in settings.DOCTOR_EMAILS:
+        raise HTTPException(
+            status_code=403, detail="User is not registered as a patient"
+        )
+    access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    return Token(
+        access_token=security.create_access_token(
+            user.id, expires_delta=access_token_expires
+        )
+    )
 
+# @router.post("/login/access-token")
+# def login_access_token(
+#     session: SessionDep, form_data: Annotated[OAuth2PasswordRequestForm, Depends()]
+# ) -> Token:
+#     """
+#     Legacy endpoint: OAuth2 compatible token login.
+#     """
+#     user = crud.authenticate(
+#         session=session, email=form_data.username, password=form_data.password
+#     )
+#     if not user:
+#         raise HTTPException(status_code=400, detail="Incorrect email or password")
+#     if not user.is_active:
+#         raise HTTPException(status_code=400, detail="Inactive user")
+#     access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+#     return Token(
+#         access_token=security.create_access_token(
+#             user.id, expires_delta=access_token_expires
+#         )
+#     )
 
-@router.post("/", response_model=ItemPublic)
-def create_item(
-    *, session: SessionDep, current_user: CurrentUser, item_in: ItemCreate
-) -> Any:
+@router.post("/login/test-token", response_model=UserPublic)
+def test_token(current_user: CurrentUser) -> Any:
     """
-    Create new item.
+    Test access token.
     """
-    item = Item.model_validate(item_in, update={"owner_id": current_user.id})
-    session.add(item)
+    return current_user
+
+@router.post("/password-recovery/{email}")
+def recover_password(email: str, session: SessionDep) -> Message:
+    """
+    Password Recovery.
+    """
+    user = crud.get_user_by_email(session=session, email=email)
+    if not user:
+        raise HTTPException(
+            status_code=404,
+            detail="The user with this email does not exist in the system.",
+        )
+    password_reset_token = generate_password_reset_token(email=email)
+    email_data = generate_reset_password_email(
+        email_to=user.email, email=email, token=password_reset_token
+    )
+    send_email(
+        email_to=user.email,
+        subject=email_data.subject,
+        html_content=email_data.html_content,
+    )
+    return Message(message="Password recovery email sent")
+
+@router.post("/reset-password/")
+def reset_password(session: SessionDep, body: NewPassword) -> Message:
+    """
+    Reset password.
+    """
+    email = verify_password_reset_token(token=body.token)
+    if not email:
+        raise HTTPException(status_code=400, detail="Invalid token")
+    user = crud.get_user_by_email(session=session, email=email)
+    if not user:
+        raise HTTPException(
+            status_code=404,
+            detail="The user with this email does not exist in the system.",
+        )
+    if not user.is_active:
+        raise HTTPException(status_code=400, detail="Inactive user")
+    hashed_password = get_password_hash(password=body.new_password)
+    user.hashed_password = hashed_password
+    session.add(user)
     session.commit()
-    session.refresh(item)
-    return item
+    return Message(message="Password updated successfully")
 
-
-@router.put("/{id}", response_model=ItemPublic)
-def update_item(
-    *,
-    session: SessionDep,
-    current_user: CurrentUser,
-    id: uuid.UUID,
-    item_in: ItemUpdate,
-) -> Any:
+@router.post(
+    "/password-recovery-html-content/{email}",
+    dependencies=[Depends(get_current_active_superuser)],
+    response_class=HTMLResponse,
+)
+def recover_password_html_content(email: str, session: SessionDep) -> Any:
     """
-    Update an item.
+    HTML Content for Password Recovery.
     """
-    item = session.get(Item, id)
-    if not item:
-        raise HTTPException(status_code=404, detail="Item not found")
-    if not current_user.is_superuser and (item.owner_id != current_user.id):
-        raise HTTPException(status_code=400, detail="Not enough permissions")
-    update_dict = item_in.model_dump(exclude_unset=True)
-    item.sqlmodel_update(update_dict)
-    session.add(item)
-    session.commit()
-    session.refresh(item)
-    return item
-
-
-@router.delete("/{id}")
-def delete_item(
-    session: SessionDep, current_user: CurrentUser, id: uuid.UUID
-) -> Message:
-    """
-    Delete an item.
-    """
-    item = session.get(Item, id)
-    if not item:
-        raise HTTPException(status_code=404, detail="Item not found")
-    if not current_user.is_superuser and (item.owner_id != current_user.id):
-        raise HTTPException(status_code=400, detail="Not enough permissions")
-    session.delete(item)
-    session.commit()
-    return Message(message="Item deleted successfully")
+    user = crud.get_user_by_email(session=session, email=email)
+    if not user:
+        raise HTTPException(
+            status_code=404,
+            detail="The user with this username does not exist in the system.",
+        )
+    password_reset_token = generate_password_reset_token(email=email)
+    email_data = generate_reset_password_email(
+        email_to=user.email, email=email, token=password_reset_token
+    )
+    return HTMLResponse(
+        content=email_data.html_content, headers={"subject:": email_data.subject}
+    )

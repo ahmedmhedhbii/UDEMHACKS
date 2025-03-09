@@ -1,114 +1,111 @@
-import uuid
+from fastapi import APIRouter, HTTPException, File, UploadFile
+from pydantic import BaseModel
+from transformers import pipeline
+import PyPDF2
 
-from pydantic import EmailStr
-from sqlmodel import Field, Relationship, SQLModel
+# For image processing:
+import numpy as np
+from PIL import Image
+import tensorflow as tf
+from tensorflow.keras.models import load_model
 
+router = APIRouter(tags=["doctor-llm"])
 
-# Shared properties
-class UserBase(SQLModel):
-    email: EmailStr = Field(unique=True, index=True, max_length=255)
-    is_active: bool = True
-    is_superuser: bool = False
-    full_name: str | None = Field(default=None, max_length=255)
-
-
-# Properties to receive via API on creation
-class UserCreate(UserBase):
-    password: str = Field(min_length=8, max_length=40)
-
-
-class UserRegister(SQLModel):
-    email: EmailStr = Field(max_length=255)
-    password: str = Field(min_length=8, max_length=40)
-    full_name: str | None = Field(default=None, max_length=255)
-
-
-# Properties to receive via API on update, all are optional
-class UserUpdate(UserBase):
-    email: EmailStr | None = Field(default=None, max_length=255)  # type: ignore
-    password: str | None = Field(default=None, min_length=8, max_length=40)
-
-
-class UserUpdateMe(SQLModel):
-    full_name: str | None = Field(default=None, max_length=255)
-    email: EmailStr | None = Field(default=None, max_length=255)
-
-
-class UpdatePassword(SQLModel):
-    current_password: str = Field(min_length=8, max_length=40)
-    new_password: str = Field(min_length=8, max_length=40)
-
-
-# Database model, database table inferred from class name
-class User(UserBase, table=True):
-    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
-    hashed_password: str
-    items: list["Item"] = Relationship(back_populates="owner", cascade_delete=True)
-
-
-# Properties to return via API, id is always required
-class UserPublic(UserBase):
-    id: uuid.UUID
-
-
-class UsersPublic(SQLModel):
-    data: list[UserPublic]
-    count: int
-
-
-# Shared properties
-class ItemBase(SQLModel):
-    title: str = Field(min_length=1, max_length=255)
-    description: str | None = Field(default=None, max_length=255)
-
-
-# Properties to receive on item creation
-class ItemCreate(ItemBase):
-    pass
-
-
-# Properties to receive on item update
-class ItemUpdate(ItemBase):
-    title: str | None = Field(default=None, min_length=1, max_length=255)  # type: ignore
-
-
-# Database model, database table inferred from class name
-class Item(ItemBase, table=True):
-    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
-    title: str = Field(max_length=255)
-    owner_id: uuid.UUID = Field(
-        foreign_key="user.id", nullable=False, ondelete="CASCADE"
+# ----------------------------------------------------------------------
+# Initialize the Medical LLM pipeline (for text & PDF inputs)
+# ----------------------------------------------------------------------
+try:
+    medical_llm = pipeline(
+    "text-generation",
+    model="openlifescienceai/open_medical_llm_leaderboard",
+    use_safetensors=True,
+    trust_remote_code=True,
+    device=0  
     )
-    owner: User | None = Relationship(back_populates="items")
+
+except Exception as e:
+    raise RuntimeError(f"Failed to load open_medical_llm_leaderboard model: {e}")
 
 
-# Properties to return via API, id is always required
-class ItemPublic(ItemBase):
-    id: uuid.UUID
-    owner_id: uuid.UUID
+try:
+    chexnet_model = load_model("path/to/chexnet_model.h5")
+except Exception as e:
+    raise RuntimeError(f"Failed to load CheXNet model: {e}")
 
+# ----------------------------------------------------------------------
+# Pydantic models for API requests and responses
+# ----------------------------------------------------------------------
+class LLMRequest(BaseModel):
+    input_text: str
 
-class ItemsPublic(SQLModel):
-    data: list[ItemPublic]
-    count: int
+class LLMResponse(BaseModel):
+    result: str
 
+class CheXNetResponse(BaseModel):
+    predictions: list
 
-# Generic message
-class Message(SQLModel):
-    message: str
+# ----------------------------------------------------------------------
+# Utility: Extract text from a PDF file using PyPDF2.
+# ----------------------------------------------------------------------
+def extract_text_from_pdf(pdf_file: UploadFile) -> str:
+    try:
+        # Ensure the file pointer is at the beginning.
+        pdf_file.file.seek(0)
+        reader = PyPDF2.PdfReader(pdf_file.file)
+        text = ""
+        for page in reader.pages:
+            page_text = page.extract_text()
+            if page_text:
+                text += page_text + "\n"
+        return text
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error processing PDF file: {e}")
 
+# ----------------------------------------------------------------------
+# Endpoint 1: Medical LLM for text input (with optional PDF context)
+# ----------------------------------------------------------------------
+@router.post("/use-llm", response_model=LLMResponse)
+async def doctor_use_llm(
+    request: LLMRequest,
+    pdf: UploadFile = File(None)
+):
+    """
+    Endpoint for querying the medical LLM.
+    Optionally, upload a PDF to extract text and add it as additional context.
+    """
+    combined_input = request.input_text
 
-# JSON payload containing access token
-class Token(SQLModel):
-    access_token: str
-    token_type: str = "bearer"
+    if pdf is not None:
+        pdf_text = extract_text_from_pdf(pdf)
+        combined_input += "\n\nAdditional context from PDF:\n" + pdf_text
 
+    try:
+        # Adjust parameters (like max_length) as needed.
+        output = medical_llm(combined_input, max_length=300, do_sample=True)
+        result_text = output[0]['generated_text']
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"LLM inference error: {str(e)}")
+    
+    return LLMResponse(result=result_text)
 
-# Contents of JWT token
-class TokenPayload(SQLModel):
-    sub: str | None = None
+# ----------------------------------------------------------------------
+# Endpoint 2: CheXNet for image analysis
+# ----------------------------------------------------------------------
+@router.post("/chexnet", response_model=CheXNetResponse)
+async def analyze_image(file: UploadFile = File(...)):
+    """
+    Analyzes a chest X-ray image using the CheXNet-Keras model.
+    The image is expected to be an RGB image; it is resized to 224x224 (adjust if necessary).
+    """
+    try:
+        # Open and preprocess the image.
+        image = Image.open(file.file).convert("RGB")
+        image = image.resize((224, 224))  # Resize as required by the CheXNet model.
+        img_array = np.array(image) / 255.0  # Normalize pixel values.
+        img_array = np.expand_dims(img_array, axis=0)  # Add batch dimension.
 
-
-class NewPassword(SQLModel):
-    token: str
-    new_password: str = Field(min_length=8, max_length=40)
+        preds = chexnet_model.predict(img_array)
+        # Optionally, apply postprocessing to the predictions here.
+        return CheXNetResponse(predictions=preds.tolist())
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Image processing error: {str(e)}")
